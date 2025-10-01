@@ -8,3 +8,7 @@ generate and model.py.
 Overall I was impressed with how quickly they were able to produce output of programs and how high quality they were.
 From what I had heard, I was expecting Claude to be  better since it is more focused on code, but the ChatGPT
 solution seemed to work better (by actually being runable).
+
+For questions seven and eight for Part C I also used ChatGPT to calculate the number of flops since I was unsure
+how to go about calculating those numbers. This helped me understand better how intensive the training can be
+and what parts required more operations compared to others.
