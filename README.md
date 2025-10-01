@@ -1,6 +1,6 @@
 # Pytorch_with_tinyshakespeare_example
 
-This is a test of creating a Transformer Model using Pytorch and training it with tiny shakespeare. The code was adapted from https://github.com/pytorch/examples/tree/main/word_language_model with the use of AI (see AI_HELP) for examples of what was done.
+This is a test of creating a Transformer Model using Pytorch and training it with tiny shakespeare. The code was adapted from https://github.com/pytorch/examples/tree/main/word_language_model with the use of AI (see AI_HELP and AI_followup) for examples of what was done.
 # Install and Run
 To install it is recommened to use a venv
 ```
