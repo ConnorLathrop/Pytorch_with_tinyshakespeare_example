@@ -1,0 +1,10 @@
+Claude I thought would work better than it did. It produced what seemed to be really good code with lots of explanations
+but it failed to actually work. The training worked, but generating the text did not. And attempts to fix the code
+did not work.
+
+The chatgpt solution got me close to what I was looking for. I took what it produced and made the three files from it, train,
+generate and model.py.
+
+Overall I was impressed with how quickly they were able to produce output of programs and how high quality they were.
+From what I had heard, I was expecting Claude to be  better since it is more focused on code, but the ChatGPT
+solution seemed to work better (by actually being runable).

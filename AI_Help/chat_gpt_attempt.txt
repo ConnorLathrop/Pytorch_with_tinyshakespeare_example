@@ -1,0 +1,517 @@
+I want to change this pytorch example: https://github.com/pytorch/examples/tree/main/word_language_model
+to do this:
+Dataset 
+Use Tiny Shakespeare: https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt 
+Train/validation split: 90% / 10% 
+Tasks 
+Implement a Transformer (inference + training): 
+Token + positional embeddings 
+Multi-head self-attention (with causal mask) 
+Feed-forward MLP block 
+LayerNorm / RMSNorm 
+Residual connections 
+Final linear layer projecting to vocab 
+Train Colab Personal machine: 
+Train with cross-entropy loss, AdamW optimizer. 
+Suggested config: 
+Layers: 4 
+Hidden size: 256 
+Heads: 4 
+Seq length: 128 
+Batch size: 64 
+Run for suitable number of epochs, report training and validation loss. 
+Generate text: 
+Implement decoding. 
+Prompt with "ROMEO:" or "JULIET:" and generate 200 tokens. 
+Save outputs.
+ChatGPT:
+Nice — I'll give you a single, ready-to-run PyTorch script that replaces the word-language-model example with a character-level Transformer trained on Tiny Shakespeare and implements everything you asked for (token + positional embeddings, multi-head causal self-attention, feed-forward block, LayerNorm/RMSNorm option, residuals, final projection, AdamW, CrossEntropy, decoding, saving outputs). I’ll also include a `requirements.txt` and short run instructions for Colab / local.
+
+Save the script below as `train_transformer_shakespeare.py` and `requirements.txt` as provided, then run.
+
+---
+
+# `requirements.txt`
+
+```
+torch>=2.0
+tqdm
+numpy
+```
+
+---
+
+# `train_transformer_shakespeare.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Train a small character-level Transformer on Tiny Shakespeare.
+
+Features implemented:
+- Tiny Shakespeare dataset download & 90/10 split
+- Char tokenizer (vocab from dataset)
+- Token + learnable positional embeddings
+- Multi-head causal self-attention
+- Feed-forward MLP blocks
+- LayerNorm or RMSNorm (selectable)
+- Residual connections
+- Final linear projection to vocab
+- Training loop with CrossEntropyLoss, AdamW
+- Decoding / generation (prompt-based)
+- Save outputs & model checkpoints
+
+Suggested config (default):
+layers=4, hidden=256, heads=4, seq_len=128, batch_size=64
+"""
+
+import os
+import math
+import argparse
+import urllib.request
+from pathlib import Path
+from collections import defaultdict
+import random
+import time
+import json
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from tqdm import tqdm
+
+# -------------------------
+# Utils / Data
+# -------------------------
+URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+def download_dataset(path="data/input.txt"):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        print("Downloading Tiny Shakespeare...")
+        urllib.request.urlretrieve(URL, str(path))
+    with open(path, "r", encoding="utf-8") as f:
+        data = f.read()
+    return data
+
+class CharDataset(torch.utils.data.Dataset):
+    def __init__(self, data_str, seq_len, split='train', split_ratio=0.9):
+        assert split in ('train','val')
+        # build vocab from whole text
+        chars = sorted(list(set(data_str)))
+        self.stoi = {ch:i for i,ch in enumerate(chars)}
+        self.itos = {i:ch for ch,i in self.stoi.items()}
+        self.vocab_size = len(chars)
+        data = np.array([self.stoi[c] for c in data_str], dtype=np.int64)
+        N = len(data)
+        split_at = int(N * split_ratio)
+        if split=='train':
+            self.data = data[:split_at]
+        else:
+            self.data = data[split_at:]
+        self.seq_len = seq_len
+
+    def __len__(self):
+        # choose number of random sequences per epoch
+        return max(1, len(self.data) // self.seq_len)
+
+    def __getitem__(self, idx):
+        # random start
+        max_start = len(self.data) - self.seq_len - 1
+        if max_start <= 0:
+            start = 0
+        else:
+            start = random.randint(0, max_start)
+        chunk = self.data[start:start+self.seq_len+1]
+        x = torch.from_numpy(chunk[:-1]).long()
+        y = torch.from_numpy(chunk[1:]).long()
+        return x, y
+
+# -------------------------
+# Normalization: RMSNorm impl
+# -------------------------
+class RMSNorm(nn.Module):
+    # Implements RMSNorm as in https://arxiv.org/abs/1910.07467 (simple variant)
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # x: (B, T, C)
+        # compute rms over last dim
+        rms = x.norm(dim=-1, keepdim=True) * (x.size(-1) ** -0.5)
+        return x / (rms + self.eps) * self.scale
+
+# -------------------------
+# Transformer building blocks
+# -------------------------
+class MultiHeadSelfAttention(nn.Module):
+    def __init__(self, hidden, n_heads, dropout=0.1):
+        super().__init__()
+        assert hidden % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = hidden // n_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+        self.out = nn.Linear(hidden, hidden)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, causal_mask=None):
+        # x: (B, T, C)
+        B, T, C = x.shape
+        qkv = self.qkv(x)  # (B, T, 3C)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # reshape for heads
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1,2)  # (B, heads, T, head_dim)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1,2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1,2)
+
+        # compute attention
+        att = torch.matmul(q, k.transpose(-2,-1)) * self.scale  # (B, heads, T, T)
+        if causal_mask is not None:
+            att = att.masked_fill(causal_mask == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.dropout(att)
+        out = torch.matmul(att, v)  # (B, heads, T, head_dim)
+        out = out.transpose(1,2).contiguous().view(B, T, C)  # (B, T, C)
+        out = self.out(out)
+        out = self.dropout(out)
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, hidden, ff_hidden, dropout=0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden, ff_hidden),
+            nn.GELU(),
+            nn.Linear(ff_hidden, hidden),
+            nn.Dropout(dropout),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden, n_heads, ff_hidden, dropout=0.1, norm_type='layer'):
+        super().__init__()
+        self.attn = MultiHeadSelfAttention(hidden, n_heads, dropout)
+        self.ff = FeedForward(hidden, ff_hidden, dropout)
+        if norm_type == 'layer':
+            self.norm1 = nn.LayerNorm(hidden)
+            self.norm2 = nn.LayerNorm(hidden)
+        elif norm_type == 'rms':
+            self.norm1 = RMSNorm(hidden)
+            self.norm2 = RMSNorm(hidden)
+        else:
+            raise ValueError("norm_type must be 'layer' or 'rms'")
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(self, x, causal_mask=None):
+        # Attention + residual
+        x2 = self.norm1(x)
+        a = self.attn(x2, causal_mask=causal_mask)
+        x = x + self.resid_dropout(a)
+        # FF + residual
+        x2 = self.norm2(x)
+        f = self.ff(x2)
+        x = x + self.resid_dropout(f)
+        return x
+
+# -------------------------
+# Model
+# -------------------------
+class CharTransformer(nn.Module):
+    def __init__(self, vocab_size, seq_len, layers=4, hidden=256, heads=4, ff_mult=4, dropout=0.1, norm_type='layer'):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden = hidden
+        self.seq_len = seq_len
+        self.token_emb = nn.Embedding(vocab_size, hidden)
+        self.pos_emb = nn.Embedding(seq_len, hidden)  # learnable positional embeddings
+        self.drop = nn.Dropout(dropout)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(hidden, heads, ff_hidden=hidden*ff_mult, dropout=dropout, norm_type=norm_type)
+            for _ in range(layers)
+        ])
+        # final norm before head (common in transformers)
+        if norm_type == 'layer':
+            self.final_norm = nn.LayerNorm(hidden)
+        else:
+            self.final_norm = RMSNorm(hidden)
+
+        self.head = nn.Linear(hidden, vocab_size, bias=False)
+
+        # causal mask (triangle) - we'll register as buffer so it moves with model device
+        mask = torch.tril(torch.ones(seq_len, seq_len)).unsqueeze(0).unsqueeze(0)  # (1,1,seq,seq)
+        self.register_buffer("causal_mask", mask)  # float tensor of 0/1
+
+    def forward(self, x):
+        """
+        x: (B, T) long tokens
+        returns logits: (B, T, vocab)
+        """
+        B, T = x.shape
+        assert T <= self.seq_len, "input sequence length must be <= model seq_len"
+        tok = self.token_emb(x)  # (B, T, C)
+        pos_idx = torch.arange(T, device=x.device).unsqueeze(0)
+        pos = self.pos_emb(pos_idx)  # (1, T, C)
+        h = self.drop(tok + pos)
+        # sliced causal mask for T
+        causal = self.causal_mask[:, :, :T, :T]  # (1,1,T,T)
+        for b in self.blocks:
+            h = b(h, causal_mask=causal)
+        h = self.final_norm(h)
+        logits = self.head(h)  # (B,T,vocab)
+        return logits
+
+    def generate(self, start_tokens, max_new_tokens=200, temperature=1.0, sample=False, top_k=None):
+        """
+        start_tokens: torch.LongTensor (1, T0)
+        returns: list of tokens (ints) including prompt
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        seq = start_tokens.to(device)
+        generated = seq.tolist()[0]  # flatten
+        for _ in range(max_new_tokens):
+            # crop context to model seq_len
+            context = seq[:, -self.seq_len:]
+            with torch.no_grad():
+                logits = self.forward(context)  # (1, T, V)
+                logits = logits[:, -1, :] / (temperature if temperature>0 else 1.0)
+                if top_k is not None:
+                    v, _ = torch.topk(logits, top_k)
+                    min_v = v[:, -1].unsqueeze(-1)
+                    logits = torch.where(logits < min_v, torch.tensor(-1e10, device=device), logits)
+                probs = F.softmax(logits, dim=-1)
+                if sample:
+                    next_token = torch.multinomial(probs, num_samples=1)  # (1,1)
+                else:
+                    next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            next_id = int(next_token.item())
+            generated.append(next_id)
+            seq = torch.cat([seq, next_token], dim=1)
+        return generated
+
+# -------------------------
+# Training / Eval
+# -------------------------
+def train_epoch(model, dataloader, optimizer, device, scheduler=None, log_interval=100):
+    model.train()
+    total_loss = 0.0
+    steps = 0
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Train", leave=False)
+    for i, (x,y) in pbar:
+        x = x.to(device)
+        y = y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)  # (B,T,V)
+        B,T,V = logits.shape
+        loss = F.cross_entropy(logits.view(B*T, V), y.view(B*T))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        total_loss += loss.item()
+        steps += 1
+        if (i+1) % log_interval == 0:
+            pbar.set_postfix(loss=total_loss/steps)
+    return total_loss / max(1,steps)
+
+def eval_epoch(model, dataloader, device):
+    model.eval()
+    total_loss = 0.0
+    steps = 0
+    with torch.no_grad():
+        for x,y in dataloader:
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            B,T,V = logits.shape
+            loss = F.cross_entropy(logits.view(B*T, V), y.view(B*T))
+            total_loss += loss.item()
+            steps += 1
+    return total_loss / max(1,steps)
+
+# -------------------------
+# Main: argument parsing and run
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, default="data/input.txt")
+    parser.add_argument("--seq_len", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--ff_mult", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--wd", type=float, default=0.01)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--norm", choices=['layer','rms'], default='layer')
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--save_dir", type=str, default="outputs")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--generate_prompts", nargs='*', default=["ROMEO:", "JULIET:"])
+    parser.add_argument("--gen_len", type=int, default=200)
+    parser.add_argument("--sample", action="store_true", help="sample during generation (otherwise greedy)")
+    parser.add_argument("--top_k", type=int, default=None)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    # Download and load dataset
+    raw = download_dataset(args.data_path)
+    # build datasets
+    train_ds = CharDataset(raw, seq_len=args.seq_len, split='train', split_ratio=0.9)
+    val_ds = CharDataset(raw, seq_len=args.seq_len, split='val', split_ratio=0.9)
+    # ensure using same vocab mapping
+    val_ds.stoi = train_ds.stoi
+    val_ds.itos = train_ds.itos
+    val_ds.vocab_size = train_ds.vocab_size
+
+    print(f"Vocab size: {train_ds.vocab_size}")
+
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
+
+    device = torch.device(args.device)
+    model = CharTransformer(
+        vocab_size=train_ds.vocab_size,
+        seq_len=args.seq_len,
+        layers=args.layers,
+        hidden=args.hidden,
+        heads=args.heads,
+        ff_mult=args.ff_mult,
+        dropout=args.dropout,
+        norm_type=args.norm
+    ).to(device)
+
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    # optional scheduler - linear warmup not implemented; leave as is.
+    print(model)
+    print("Total params:", sum(p.numel() for p in model.parameters()))
+
+    best_val = float('inf')
+    history = {"train_loss": [], "val_loss": []}
+    for epoch in range(1, args.epochs+1):
+        start = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        val_loss = eval_epoch(model, val_loader, device)
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        elapsed = time.time() - start
+        print(f"Epoch {epoch}/{args.epochs} — train_loss {train_loss:.4f} val_loss {val_loss:.4f} time {elapsed:.1f}s")
+        # save best
+        ckpt = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "config": vars(args),
+            "vocab": train_ds.stoi,
+            "epoch": epoch,
+            "history": history,
+        }
+        torch.save(ckpt, os.path.join(args.save_dir, f"ckpt_epoch{epoch}.pth"))
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(ckpt, os.path.join(args.save_dir, "best.pth"))
+        # save history
+        with open(os.path.join(args.save_dir, "history.json"), "w") as fh:
+            json.dump(history, fh, indent=2)
+
+    # After training, generate and save outputs
+    out_path = Path(args.save_dir) / "generated_outputs.txt"
+    with open(out_path, "w", encoding="utf-8") as out_f:
+        for prompt in args.generate_prompts:
+            # encode prompt
+            ids = [train_ds.stoi.get(ch, train_ds.stoi.get('?')) for ch in prompt]
+            x = torch.tensor([ids], dtype=torch.long).to(device)
+            gen_ids = model.generate(x, max_new_tokens=args.gen_len, sample=args.sample, top_k=args.top_k)
+            text = "".join([train_ds.itos[i] for i in gen_ids])
+            out_f.write(f"PROMPT: {prompt}\n")
+            out_f.write(text + "\n\n---\n\n")
+            print(f"Generated for prompt '{prompt}':\n{text[:300]}...\n")
+    print(f"Saved generated outputs to {out_path}")
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# How this satisfies your requested features
+
+* **Dataset**: script downloads Tiny Shakespeare and constructs a 90/10 train/val split (the `CharDataset` takes `split` and `split_ratio=0.9`).
+* **Model**:
+
+  * token embeddings (`nn.Embedding`) + positional embeddings (`nn.Embedding`).
+  * Multi-head self-attention with causal mask (implemented in `MultiHeadSelfAttention` + `causal_mask` buffer).
+  * Feed-forward MLP (`FeedForward`), GELU activation.
+  * Normalization: both `LayerNorm` and `RMSNorm` available (select with `--norm rms`).
+  * Residual connections around attention and feed-forward.
+  * Final linear projection to vocab (`self.head`).
+* **Training**:
+
+  * CrossEntropyLoss (via `F.cross_entropy`).
+  * AdamW optimizer.
+  * Default config matches your suggestion: 4 layers, hidden 256, 4 heads, seq_len 128, batch_size 64. (Command-line flags let you change.)
+  * Prints epoch train/val loss and saves checkpoints (per-epoch and `best.pth`).
+* **Generation**:
+
+  * `generate()` implements autoregressive decoding with optional sampling or greedy; top-k supported.
+  * Prompts default to both `"ROMEO:"` and `"JULIET:"` and generate 200 tokens each.
+  * Generated text and the prompts are saved to `outputs/generated_outputs.txt`.
+
+# Example run commands
+
+On a machine with GPU / Colab:
+
+```bash
+# install
+pip install -r requirements.txt
+
+# train with defaults (adjust epochs for your hardware)
+python train_transformer_shakespeare.py --epochs 10 --batch_size 64 --seq_len 128 --layers 4 --hidden 256 --heads 4 --device cuda --save_dir outputs
+```
+
+If you want RMSNorm:
+
+```bash
+python train_transformer_shakespeare.py --norm rms --epochs 10
+```
+
+To use sampling during generation (more creative output):
+
+```bash
+python train_transformer_shakespeare.py --sample --top_k 50 --gen_len 200
+```
+
+# Notes & suggestions
+
+* **Epochs & compute**: Tiny Shakespeare is small; start with 10–30 epochs depending on compute to see decent results. On a single consumer GPU (e.g., RTX 2060/3060), this config trains quickly; on CPU it'll be much slower—consider lowering batch size and epochs.
+* **Checkpointing**: script saves `ckpt_epochX.pth` and `best.pth`. You can load them later by `torch.load(...)` and passing `model.load_state_dict(...)`.
+* **Decoding options**: current `generate` supports greedy (`--sample` not set) or sampling (`--sample` set) with optional `--top_k`. You can add temperature or nucleus sampling easily (it's already wired to `temperature` argument; you can expose via CLI).
+* **Optimization**: For slightly better training stability, you could add learning rate schedule (warmup + cosine) or gradient accumulation if memory is limited.
+* **Data batching**: dataset yields random contiguous slices each sample; this is simple and works well for char-level LM. If you prefer contiguous batchification (like word-language-model's batchify), we can adapt.
+
+---
+
+If you want, I can:
+
+* Add a Colab-ready notebook with GPU setup & monitoring.
+* Replace the simple dataset sampler with the contiguous "batchify" style used in the original example (faster per-epoch coverage).
+* Add a small evaluation metric (perplexity) and automatic plots of losses.
+* Provide a smaller-config quick-run for CPU-only debugging.
+
+Which of those would you like next?
