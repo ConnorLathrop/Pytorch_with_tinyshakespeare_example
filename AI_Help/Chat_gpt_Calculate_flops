@@ -1,0 +1,297 @@
+Estimate the FLOPs for one forward pass of your Transformer model. (Hint: major cost comes from QKᵀ  
+matmuls, softmax, and MLP matmuls.) 
+ChatGPT:
+Sure! Let’s carefully estimate the **FLOPs (floating point operations)** for one forward pass of your Transformer model. I’ll assume your model parameters from earlier:
+
+* **Layers:** 4
+* **Hidden size:** 256
+* **Heads:** 4
+* **Sequence length:** 128
+* **Feed-forward expansion factor:** 4 → FF hidden size = 256 × 4 = 1024
+* **Vocab size:** (V) (we’ll leave symbolic)
+
+---
+
+### Step 1: Token + Positional Embeddings
+
+* Each input token (length (T = 128)) is mapped to a vector of size (d = 256)
+* **Embedding lookup FLOPs:** negligible compared to matmuls.
+
+---
+
+### Step 2: Multi-Head Self-Attention (per layer)
+
+1. **Q, K, V projections:**
+
+* Each is a linear layer: (d \times d = 256 \times 256)
+* There are 3 projections per token, total FLOPs:
+  [
+  \text{FLOPs_QKV} = 3 \times T \times d^2 = 3 \times 128 \times 256^2
+  ]
+
+Compute:
+
+* (256^2 = 65536)
+* Multiply by 128 → 65536 × 128 = 8,388,608
+* Multiply by 3 → 25,165,824 FLOPs
+
+✅ So **~25.2M FLOPs for QKV projections per layer**.
+
+---
+
+2. **Attention scores (QKᵀ)**
+
+* Q and K are split into **h = 4 heads**, each of size (d_h = d/h = 64)
+* For one head: (T \times T \times d_h = 128 × 128 × 64 = 1,048,576) multiply-adds (each multiply-add ≈ 2 FLOPs) → ~2,097,152 FLOPs per head
+* 4 heads → 8,388,608 FLOPs
+
+✅ So **QKᵀ FLOPs ≈ 8.39M per layer**
+
+---
+
+3. **Softmax**
+
+* Softmax per token involves exponentials + normalization across (T = 128) tokens
+* Rough estimate: 5 FLOPs per element (exp + sum + div)
+* Total elements: (T × T × h = 128 × 128 × 4 = 65,536)
+* FLOPs ≈ 65,536 × 5 ≈ 327,680
+
+✅ Softmax cost is small compared to matmuls (~0.3M FLOPs)
+
+---
+
+4. **Attention × V**
+
+* Each head: (T × T × d_h = 128 × 128 × 64) → 1,048,576 × 2 FLOPs ≈ 2,097,152
+* 4 heads → 8,388,608 FLOPs
+
+5. **Output projection**
+
+* Linear layer: (T × d × d = 128 × 256 × 256 = 8,388,608) FLOPs
+
+---
+
+**Total self-attention per layer:**
+
+| Component     | FLOPs  |
+| ------------- | ------ |
+| QKV proj      | 25.17M |
+| QKᵀ           | 8.39M  |
+| softmax       | 0.33M  |
+| attention × V | 8.39M  |
+| output proj   | 8.39M  |
+| **Total**     | ~50.7M |
+
+---
+
+### Step 3: Feed-Forward Network (per layer)
+
+* Two linear layers:
+
+1. (d → 4d = 256 → 1024) → 128 tokens × 256 × 1024 × 2 FLOPs (multiply + add)
+
+* Compute: 128 × 256 × 1024 × 2 = 67,108,864 FLOPs
+
+2. (4d → d = 1024 → 256) → 128 × 1024 × 256 × 2 = 67,108,864 FLOPs
+
+✅ FFN per layer ≈ 134.2M FLOPs
+
+---
+
+### Step 4: LayerNorm / RMSNorm
+
+* ~2 × d FLOPs per token per layer (multiplication + addition)
+* Very small compared to matmuls → negligible (~65k FLOPs per layer)
+
+---
+
+### Step 5: Total per layer
+
+* Self-attention ≈ 50.7M
+* FFN ≈ 134.2M
+* **Layer total ≈ 185M FLOPs**
+
+4 layers → 185M × 4 ≈ 740M FLOPs
+
+---
+
+### Step 6: Final linear layer to vocab
+
+* Linear layer: (T × d × V = 128 × 256 × V) multiply-adds → 128 × 256 × V × 2 FLOPs ≈ 65,536 × V FLOPs
+
+* For **tiny Shakespeare**, (V ≈ 65) → 65,536 × 65 ≈ 4.26M FLOPs
+
+---
+
+### ✅ Step 7: Total forward pass
+
+[
+\text{Total FLOPs} ≈ 740M + 4.26M ≈ 744M FLOPs
+]
+
+> Rounded, **≈ 0.74 GFLOPs** per forward pass for one sequence of 128 tokens.
+
+---
+
+**Summary Table**
+
+| Component                 | FLOPs (approx)  |
+| ------------------------- | --------------- |
+| Self-Attention (4 layers) | 203M × 4 = 740M |
+| FFN (4 layers)            | 134M × 4 = 536M |
+| Final linear (to vocab)   | 4.3M            |
+| **Total**                 | ~744M           |
+
+> Note: We approximated multiply-add as 2 FLOPs. LayerNorm and softmax are negligible.
+
+---
+
+If you want, I can **also estimate FLOPs for one training step** (forward + backward) — it’s roughly **6×** the forward pass.
+
+Do you want me to do that?
+Me:
+Estimate the memory footprint (weights + activations) for your model. 
+Chat GPT:
+Sure! Let’s carefully estimate the **memory footprint** of your Transformer model in terms of **weights and activations**, based on the parameters you gave:
+
+* **Layers:** 4
+* **Hidden size:** 256
+* **Heads:** 4
+* **Seq length:** 128
+* **Feed-forward expansion:** 4 → FFN hidden size = 1024
+* **Vocab size:** (V \approx 65)
+
+We’ll assume **float32 (4 bytes per number)**.
+
+---
+
+## 1️⃣ Weights
+
+### (a) Embeddings
+
+* Token embedding: `vocab_size × d` → 65 × 256 = 16,640
+* Positional embedding: `max_seq_len × d` → 128 × 256 = 32,768
+* Total embedding weights: 16,640 + 32,768 ≈ **49,408 floats** → 49,408 × 4 bytes ≈ **0.2 MB**
+
+---
+
+### (b) Self-Attention weights (per layer)
+
+* Q, K, V projections: `3 × d × d` → 3 × 256 × 256 = 196,608
+* Output projection: `d × d = 256 × 256 = 65,536`
+* Total per layer: 196,608 + 65,536 ≈ 262,144
+* 4 layers → 262,144 × 4 = 1,048,576 floats → 1,048,576 × 4 bytes ≈ **4 MB**
+
+---
+
+### (c) Feed-Forward Network weights (per layer)
+
+* First linear: `d × 4d = 256 × 1024 = 262,144`
+* Second linear: `4d × d = 1024 × 256 = 262,144`
+* Total per layer: 524,288
+* 4 layers → 524,288 × 4 = 2,097,152 floats → 2,097,152 × 4 bytes ≈ **8 MB**
+
+---
+
+### (d) Final output linear layer
+
+* `d × vocab_size = 256 × 65 = 16,640` → 16,640 × 4 bytes ≈ **0.06 MB**
+
+---
+
+### ✅ Total weights
+
+| Component      | Size (MB)     |
+| -------------- | ------------- |
+| Embeddings     | 0.2           |
+| Self-Attention | 4             |
+| FFN            | 8             |
+| Final linear   | 0.06          |
+| **Total**      | **≈ 12.3 MB** |
+
+> So the **model parameters alone** fit in ~12 MB.
+
+---
+
+## 2️⃣ Activations
+
+Activations dominate memory during training. We’ll compute **per layer** and include sequence length and batch size. Assume **batch_size = 64**.
+
+### (a) Embedding output
+
+* `batch_size × seq_len × d = 64 × 128 × 256 = 2,097,152` floats → 8.39 MB
+
+---
+
+### (b) Self-Attention activations
+
+* Q, K, V: same size as embedding → 3 × 2,097,152 = 6,291,456 → 25.2 MB
+* Attention scores (QKᵀ): `batch × heads × seq × seq = 64 × 4 × 128 × 128 = 4,194,304` → 16.8 MB
+* Attention output: `batch × seq × d = 2,097,152` → 8.39 MB
+
+✅ Total attention activations per layer ≈ 50.3 MB
+
+---
+
+### (c) Feed-Forward activations
+
+* First linear: `batch × seq × 4d = 64 × 128 × 1024 = 8,388,608` → 32 MB
+* Second linear: `batch × seq × d = 2,097,152` → 8.39 MB
+
+✅ FFN activations per layer ≈ 40.4 MB
+
+---
+
+### (d) Total activations per layer
+
+* 50.3 + 40.4 ≈ 90.7 MB
+* 4 layers → 90.7 × 4 ≈ 362.8 MB
+
+---
+
+### (e) Final linear layer output
+
+* `batch × seq × vocab_size = 64 × 128 × 65 = 532,480` → 2.1 MB
+
+---
+
+### ✅ Total activation memory (forward pass)
+
+* Embeddings: 8.4 MB
+* Layers: 362.8 MB
+* Final linear: 2.1 MB
+
+**Total ≈ 373 MB**
+
+> During **training**, activations need to be stored for backward pass, so actual memory footprint ~2× forward activations → ~746 MB
+
+---
+
+## 3️⃣ Total GPU memory (weights + activations)
+
+| Component                 | Size    |
+| ------------------------- | ------- |
+| Weights                   | 12 MB   |
+| Forward activations       | 373 MB  |
+| Backward activations      | ~373 MB |
+| **Total training memory** | ~746 MB |
+
+> Forward-only inference requires only ~373 MB + 12 MB ≈ 385 MB
+
+---
+
+### ✅ Summary
+
+* **Weights:** ~12 MB
+* **Forward activations:** ~373 MB
+* **Training (forward + backward):** ~746 MB
+* **Inference:** ~385 MB
+
+---
+
+If you want, I can also **break down memory per attention head** and per FFN layer to see which part dominates most — helpful for **GPU optimization**.
+
+Do you want me to do that?
+
+
+Double checking the outputs they seemed to be correct which is why I included them in the report.
